@@ -3,22 +3,50 @@ Smart Greenhouse Automation Server
 - Подключается к MQTT (Adafruit IO)
 - Получает и парсит телеметрию с ESP32
 - Обрабатывает системные команды и отправляет статус/логи обратно на ESP32
+- Ведёт историю измерений в data/telemetry.csv
 """
 
+import csv
 import paho.mqtt.client as mqtt
 import time
 import os
 from datetime import datetime
 
 # ======================= НАСТРОЙКИ (ЧЕРЕЗ ENV ИЛИ ПЛЕЙСХОЛДЕРЫ) =======================
-MQTT_HOST     = "io.adafruit.com"
-MQTT_PORT     = 1883
+MQTT_HOST     = os.environ.get("MQTT_HOST", "io.adafruit.com")
+MQTT_PORT     = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "YOUR_MQTT_USERNAME")
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "YOUR_MQTT_SECRET_KEY")
 
-DATA_TOPIC    = "brobropups/feeds/smartgarden_data"
-CONTROL_TOPIC = "brobropups/feeds/smartgarden_control"
-LOG_TOPIC     = "brobropups/feeds/smartgarden_log"
+# Имя фидов Adafruit IO строится из логина владельца
+_FEED_OWNER   = os.environ.get("MQTT_FEED_OWNER", MQTT_USERNAME)
+DATA_TOPIC    = os.environ.get("DATA_TOPIC",    f"{_FEED_OWNER}/feeds/smartgarden_data")
+CONTROL_TOPIC = os.environ.get("CONTROL_TOPIC", f"{_FEED_OWNER}/feeds/smartgarden_control")
+LOG_TOPIC     = os.environ.get("LOG_TOPIC",     f"{_FEED_OWNER}/feeds/smartgarden_log")
+
+# ======================= ИСТОРИЯ ИЗМЕРЕНИЙ =======================
+DATA_DIR      = os.environ.get("GREENHOUSE_DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
+CSV_PATH      = os.path.join(DATA_DIR, "telemetry.csv")
+CSV_HEADER    = ["timestamp", "soil_pct", "temp_c", "humidity_pct", "pump_on", "light_on"]
+
+def ensure_csv():
+    """Создаёт CSV с заголовком, если файла ещё нет."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(CSV_PATH):
+        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(CSV_HEADER)
+
+def log_telemetry_row(soil, temp, hum, pump, light):
+    """Дописывает строку телеметрии. Ошибки записи не должны ронять сервер."""
+    try:
+        ensure_csv()
+        with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                datetime.now().isoformat(timespec="seconds"),
+                soil, temp, hum, pump, light,
+            ])
+    except OSError as e:
+        print(f"⚠️ Failed to write telemetry log: {e}")
 
 # ======================= ТЕКУЩЕЕ СОСТОЯНИЕ СИСТЕМЫ =======================
 sensor_data = {
@@ -26,21 +54,25 @@ sensor_data = {
     "temp": 0.0,
     "hum": 0.0,
     "pump": 0,
+    "light": 0,
     "updated": "never"
 }
 
 def generate_status_report(lang: str = "EN") -> str:
     """Генерирует строгое шаблонное сообщение о состоянии системы."""
-    pump_status = "ON" if sensor_data["pump"] else "OFF"
-    
+    pump_status  = "ON" if sensor_data["pump"] else "OFF"
+    light_status = "ON" if sensor_data.get("light") else "OFF"
+
     if lang == "RU":
         # Транслит для вывода на TFT_eSPI без поддержки кириллицы
         soil_alert = "VSE OK" if sensor_data["soil"] >= 30 else "SUKHO! NUZHEN POLIV"
-        report = f"STATION OK. Temp:{sensor_data['temp']}C, Vlazhnost:{sensor_data['hum']}%, Pochva:{sensor_data['soil']}%. Nasos:{pump_status}. Status: {soil_alert}"
+        report = (f"STATION OK. Temp:{sensor_data['temp']}C, Vlazhnost:{sensor_data['hum']}%, "
+                  f"Pochva:{sensor_data['soil']}%. Nasos:{pump_status}. Svet:{light_status}. Status: {soil_alert}")
     else:
         soil_alert = "MOIST" if sensor_data["soil"] >= 30 else "DRY! NEED WATER"
-        report = f"STATION OK. Temp:{sensor_data['temp']}C, Hum:{sensor_data['hum']}%, Soil:{sensor_data['soil']}%. Pump:{pump_status}. Status: {soil_alert}"
-        
+        report = (f"STATION OK. Temp:{sensor_data['temp']}C, Hum:{sensor_data['hum']}%, "
+                  f"Soil:{sensor_data['soil']}%. Pump:{pump_status}. Light:{light_status}. Status: {soil_alert}")
+
     return report[:200]  # Ограничение под буфер экрана ESP32
 
 # ======================= ОБРАБОТЧИКИ MQTT =======================
@@ -67,10 +99,18 @@ def on_message(client, userdata, msg):
             sensor_data["temp"]    = float(parts[1])
             sensor_data["hum"]     = float(parts[2])
             sensor_data["pump"]    = int(parts[3])
+            # Прошивки без фотопериода шлют 4 поля вместо 5
+            sensor_data["light"]   = int(parts[4]) if len(parts) > 4 else sensor_data.get("light", 0)
             sensor_data["updated"] = datetime.now().strftime("%H:%M")
-            print(f"🌱 Soil:{sensor_data['soil']}% Temp:{sensor_data['temp']}°C Hum:{sensor_data['hum']}% Pump:{'ON' if sensor_data['pump'] else 'OFF'}")
-        except Exception as e:
-            print(f"⚠️ Telemetry parse error: {e}")
+            print(f"🌱 Soil:{sensor_data['soil']}% Temp:{sensor_data['temp']}°C Hum:{sensor_data['hum']}% "
+                  f"Pump:{'ON' if sensor_data['pump'] else 'OFF'} Light:{'ON' if sensor_data['light'] else 'OFF'}")
+
+            log_telemetry_row(
+                sensor_data["soil"], sensor_data["temp"], sensor_data["hum"],
+                sensor_data["pump"], sensor_data["light"],
+            )
+        except (ValueError, IndexError) as e:
+            print(f"⚠️ Telemetry parse error: {e} (payload={payload!r})")
 
     # 2. Обработка текстовых команд с терминала ESP32
     elif topic == CONTROL_TOPIC and payload.startswith("CMD:"):
