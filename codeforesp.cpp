@@ -6,21 +6,17 @@
 #include <SPI.h>
 #include <DHT.h>
 #include <HTTPClient.h>
+#include <time.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "driver/gpio.h"
+#include "config.h"
 
-const char* ssid     = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
-
-#define MQTT_SERVER   "io.adafruit.com"
-#define MQTT_PORT     1883
-#define MQTT_USERNAME "YOUR_MQTT_USERNAME"
-#define MQTT_PASSWORD "YOUR_MQTT_SECRET_KEY"
-#define CLIENT_ID     "ESP32_SmartGarden_PRO"
-#define DATA_TOPIC    "brobropups/feeds/smartgarden_data"
-#define CONTROL_TOPIC "brobropups/feeds/smartgarden_control"
-#define LOG_TOPIC     "brobropups/feeds/smartgarden_log"
+// ======================= NTP / TIMEZONE =======================
+// Asia/Qyzylorda, UTC+5, no DST.
+const long  GMT_OFFSET_SEC     = 5 * 3600;
+const int   DAYLIGHT_OFFSET_SEC = 0;
+const char* NTP_SERVER          = "pool.ntp.org";
 
 #define DHTPIN          22
 #define DHTTYPE         DHT11
@@ -67,11 +63,66 @@ float prevTemp = -999, prevHum = -999;
 int   prevSoil = -999;
 bool  prevPump = false, prevWater = true;
 
+// ======================= PHOTOPERIOD (grow light) =======================
+int  lightOnHour  = 6;     // light ON at 06:00 local time
+int  lightOffHour = 22;    // light OFF at 22:00 local time -> 16h light / 8h dark
+bool lightAuto    = true;  // false = manual override via MQTT
+bool lightOn      = false;
+bool prevLight    = true;  // forces redraw on first pass
+bool timeSynced   = false;
+
+unsigned long lastLightCheck = 0;
+const unsigned long LIGHT_CHECK_DELAY = 30000;
+
 bool kbRussian = false;
 const char* KB_EN_R1 = "QWERTYUIOP";
 const char* KB_EN_R2 = "ASDFGHJKL";
 const char* KB_EN_R3 = "ZXCVBNM";
 const char* TRANSLIT_MAP = "QWERTYUIOPASDFGHJKLZXCVBNM";
+
+// Decides the grow light state from the configured photoperiod and local time.
+// Handles schedules that cross midnight (e.g. 20:00 -> 06:00).
+void updateLightSchedule() {
+  if (!lightAuto) return;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 100)) {
+    timeSynced = false;
+    return;
+  }
+  timeSynced = true;
+
+  int hour = timeinfo.tm_hour;
+  bool shouldBeOn;
+  if (lightOnHour <= lightOffHour) {
+    shouldBeOn = (hour >= lightOnHour && hour < lightOffHour);
+  } else {
+    shouldBeOn = (hour >= lightOnHour || hour < lightOffHour);
+  }
+
+  if (shouldBeOn != lightOn) {
+    lightOn = shouldBeOn;
+    digitalWrite(LIGHT_RELAY_PIN, lightOn ? RELAY_ON : RELAY_OFF);
+    if (mqtt.connected()) {
+      mqtt.publish(LOG_TOPIC, (String("LIGHT: ") + (lightOn ? "ON (auto)" : "OFF (auto)")).c_str());
+    }
+  }
+}
+
+// Parses "SET_PHOTOPERIOD:<onHour>-<offHour>", e.g. "SET_PHOTOPERIOD:6-22"
+void applyPhotoperiodCommand(const String& msg) {
+  int sep = msg.indexOf('-');
+  if (sep < 0) return;
+  String onPart  = msg.substring(String("SET_PHOTOPERIOD:").length(), sep);
+  String offPart = msg.substring(sep + 1);
+  int onH  = onPart.toInt();
+  int offH = offPart.toInt();
+  if (onH >= 0 && onH <= 23 && offH >= 0 && offH <= 23) {
+    lightOnHour  = onH;
+    lightOffHour = offH;
+    lightAuto    = true;
+  }
+}
 
 void checkCamConnection() {
   if (WiFi.status() != WL_CONNECTED) { camConnected = false; return; }
@@ -123,13 +174,15 @@ void updateDashboardData() {
     tft.drawString(s, 105, 160, 6);
     prevSoil = soilPct;
   }
-  if (pumpOn != prevPump || waterOk != prevWater) {
+  if (pumpOn != prevPump || waterOk != prevWater || lightOn != prevLight) {
     tft.fillRect(211, 135, 98, 58, TFT_BLACK);
     tft.setTextColor(pumpOn ? TFT_GREEN : tft.color565(150,150,150));
-    tft.drawString(pumpOn ? "PUMP: ON" : "PUMP:OFF", 260, 152, 2);
+    tft.drawString(pumpOn ? "PUMP: ON" : "PUMP:OFF", 260, 146, 2);
     tft.setTextColor(waterOk ? TFT_CYAN : TFT_RED);
-    tft.drawString(waterOk ? "H2O: OK" : "H2O: LOW", 260, 174, 2);
-    prevPump = pumpOn; prevWater = waterOk;
+    tft.drawString(waterOk ? "H2O: OK" : "H2O: LOW", 260, 164, 2);
+    tft.setTextColor(lightOn ? TFT_YELLOW : tft.color565(150,150,150));
+    tft.drawString(lightOn ? "LIGHT: ON" : "LIGHT:OFF", 260, 182, 2);
+    prevPump = pumpOn; prevWater = waterOk; prevLight = lightOn;
   }
 }
 
@@ -365,10 +418,10 @@ void drawScreen() {
 
     tft.drawRoundRect(210, 115, 100, 80, 4, tft.color565(50,50,50));
     tft.fillRect(210, 115, 100, 18, tft.color565(80,80,80));
-    tft.drawString("PUMP & H2O", 260, 124, 2);
+    tft.drawString("STATUS", 260, 124, 2);
 
     prevTemp = prevHum = -999; prevSoil = -999;
-    prevPump = !pumpOn; prevWater = !waterOk;
+    prevPump = !pumpOn; prevWater = !waterOk; prevLight = !lightOn;
     updateDashboardData();
 
   } else if (currentTab == 1) {
@@ -384,6 +437,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (String(topic) == CONTROL_TOPIC) {
     if (msg == "PUMP_ON"  && !pumpOn) { pumpOn = true;  digitalWrite(PUMP_RELAY_PIN, RELAY_ON);  }
     if (msg == "PUMP_OFF" &&  pumpOn) { pumpOn = false; digitalWrite(PUMP_RELAY_PIN, RELAY_OFF); }
+    if (msg == "LIGHT_ON")  { lightAuto = false; lightOn = true;  digitalWrite(LIGHT_RELAY_PIN, RELAY_ON); }
+    if (msg == "LIGHT_OFF") { lightAuto = false; lightOn = false; digitalWrite(LIGHT_RELAY_PIN, RELAY_OFF); }
+    if (msg == "LIGHT_AUTO") { lightAuto = true; updateLightSchedule(); }
+    if (msg.startsWith("SET_PHOTOPERIOD:")) { applyPhotoperiodCommand(msg); updateLightSchedule(); }
     if (msg == "CLEAR_CHAT") {
       logHistoryCount = 0; logScrollOffset = 0;
       if (currentTab == 2) drawConsoleTab();
@@ -517,6 +574,7 @@ void setup() {
   REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PUMP_RELAY_PIN));
   REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << LIGHT_RELAY_PIN));
   pinMode(WATER_SENSOR_PIN, INPUT);
+  pinMode(PUMP_RELAY_PIN,  OUTPUT);
   pinMode(LIGHT_RELAY_PIN, OUTPUT);
   digitalWrite(PUMP_RELAY_PIN,  RELAY_OFF);
   digitalWrite(LIGHT_RELAY_PIN, RELAY_OFF);
@@ -543,6 +601,11 @@ void setup() {
     Serial.println("WiFi OK: " + WiFi.localIP().toString());
     tft.setTextColor(TFT_GREEN);
     tft.drawString("WiFi OK!", 160, 138, 2);
+
+    // Photoperiod scheduling needs wall-clock time, not uptime.
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    struct tm timeinfo;
+    timeSynced = getLocalTime(&timeinfo, 5000);
   } else {
     tft.setTextColor(TFT_RED);
     tft.drawString("WiFi FAILED", 160, 138, 2);
@@ -553,6 +616,7 @@ void setup() {
   mqtt.setCallback(mqttCallback);
   dht.begin();
 
+  updateLightSchedule();
   drawScreen();
 }
 
@@ -568,6 +632,12 @@ void loop() {
     bool wasConnected = camConnected;
     checkCamConnection();
     if (camConnected != wasConnected && currentTab == 1) drawCameraTab();
+  }
+
+  if (millis() - lastLightCheck > LIGHT_CHECK_DELAY) {
+    lastLightCheck = millis();
+    updateLightSchedule();
+    if (currentTab == 0) updateDashboardData();
   }
 
   if (millis() - lastSensorRead >= SENSOR_DELAY) {
@@ -588,7 +658,8 @@ void loop() {
     }
 
     String payload = String(soilPct) + "," + String(temp,1) + "," +
-                     String(hum,0)   + "," + String(pumpOn ? 1 : 0);
+                     String(hum,0)   + "," + String(pumpOn ? 1 : 0) + "," +
+                     String(lightOn ? 1 : 0);
     if (mqtt.connected()) mqtt.publish(DATA_TOPIC, payload.c_str());
 
     if (currentTab == 0) updateDashboardData();

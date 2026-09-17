@@ -1,0 +1,20 @@
+// ======================= config.h.example =======================
+// Скопировать в config.h и заполнить реальными значениями.
+// config.h исключён из репозитория через .gitignore.
+//
+//   cp config.h.example config.h
+// ================================================================
+
+const char* ssid     = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+#define MQTT_SERVER   "io.adafruit.com"
+#define MQTT_PORT     1883
+#define MQTT_USERNAME "YOUR_MQTT_USERNAME"
+#define MQTT_PASSWORD "YOUR_MQTT_SECRET_KEY"
+#define CLIENT_ID     "ESP32_SmartGarden_PRO"
+
+// Feed-топики Adafruit IO строятся из логина владельца аккаунта
+#define DATA_TOPIC    "YOUR_MQTT_USERNAME/feeds/smartgarden_data"
+#define CONTROL_TOPIC "YOUR_MQTT_USERNAME/feeds/smartgarden_control"
+#define LOG_TOPIC     "YOUR_MQTT_USERNAME/feeds/smartgarden_log"
