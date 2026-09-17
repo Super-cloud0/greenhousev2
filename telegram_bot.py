@@ -5,6 +5,7 @@ Smart Greenhouse Telegram Bot
 /status - текущие данные датчиков
 /photo - запрос фото с камеры
 /pump_on, /pump_off - управление помпой
+/light_on, /light_off, /light_auto - управление светом (фотопериод)
 /cmd <команда> - отправить консольную команду на сервер
 /stream - ссылка на стрим камеры
 /clear - очистить лог-экран
@@ -24,21 +25,24 @@ import threading
 
 # ======================= НАСТРОЙКИ (ЧЕРЕЗ ENV ИЛИ ПЛЕЙСХОЛДЕРЫ) =======================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-ALLOWED_USERS   = []  # Оставь пустым чтобы пускать всех, или добавь telegram user_id
+_allowed_raw    = os.environ.get("ALLOWED_USERS", "")  # напр. "123456,789012"
+ALLOWED_USERS   = [int(x) for x in _allowed_raw.split(",") if x.strip().isdigit()]
+# Пустой список -> доступ открыт всем
 
-MQTT_HOST     = "io.adafruit.com"
-MQTT_PORT     = 1883
+MQTT_HOST     = os.environ.get("MQTT_HOST", "io.adafruit.com")
+MQTT_PORT     = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "YOUR_MQTT_USERNAME")
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "YOUR_MQTT_SECRET_KEY")
 
-DATA_TOPIC    = "brobropups/feeds/smartgarden_data"
-CONTROL_TOPIC = "brobropups/feeds/smartgarden_control"
-LOG_TOPIC     = "brobropups/feeds/smartgarden_log"
+_FEED_OWNER   = os.environ.get("MQTT_FEED_OWNER", MQTT_USERNAME)
+DATA_TOPIC    = os.environ.get("DATA_TOPIC",    f"{_FEED_OWNER}/feeds/smartgarden_data")
+CONTROL_TOPIC = os.environ.get("CONTROL_TOPIC", f"{_FEED_OWNER}/feeds/smartgarden_control")
+LOG_TOPIC     = os.environ.get("LOG_TOPIC",     f"{_FEED_OWNER}/feeds/smartgarden_log")
 
-CAM_IP = "192.168.137.207"  # IP ESP32-CAM
+CAM_IP = os.environ.get("CAM_IP", "192.168.1.100")  # IP ESP32-CAM в локальной сети теплицы
 
 # ======================= СОСТОЯНИЕ =======================
-sensor_data = {"soil": 0, "temp": 0.0, "hum": 0.0, "pump": 0, "updated": "never"}
+sensor_data = {"soil": 0, "temp": 0.0, "hum": 0.0, "pump": 0, "light": 0, "updated": "never"}
 last_log_message = "Нет системных логов."
 mqtt_client_global = None
 
@@ -79,9 +83,10 @@ def mqtt_on_message(client, userdata, msg):
             sensor_data["temp"]    = float(parts[1])
             sensor_data["hum"]     = float(parts[2])
             sensor_data["pump"]    = int(parts[3])
+            sensor_data["light"]   = int(parts[4]) if len(parts) > 4 else sensor_data.get("light", 0)
             sensor_data["updated"] = datetime.now().strftime("%H:%M:%S")
-        except Exception as e:
-            log.error(f"Error parsing data: {e}")
+        except (ValueError, IndexError) as e:
+            log.error(f"Error parsing data: {e} (payload={payload!r})")
 
     elif topic == LOG_TOPIC:
         last_log_message = payload
@@ -118,7 +123,10 @@ def main_keyboard():
     kb.button(text="🎥 Видеострим", callback_data="stream")
     kb.button(text="💧 Включить помпу", callback_data="pump_on")
     kb.button(text="⛔ Выключить помпу", callback_data="pump_off")
-    kb.button(text=" Clarify 📝 Логи / Статус", callback_data="get_server_log")
+    kb.button(text="💡 Свет: вкл", callback_data="light_on")
+    kb.button(text="🌑 Свет: выкл", callback_data="light_off")
+    kb.button(text="⏱ Свет: авто (расписание)", callback_data="light_auto")
+    kb.button(text="📝 Логи / Статус", callback_data="get_server_log")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -132,7 +140,8 @@ async def cmd_start(msg: Message):
         "/status — данные телеметрии\n"
         "/photo — снимок с ESP32-CAM\n"
         "/stream — ссылка на трансляцию\n"
-        "/pump\\_on, /pump\\_off — управление реле\n"
+        "/pump\\_on, /pump\\_off — управление помпой\n"
+        "/light\\_on, /light\\_off, /light\\_auto — управление досветкой (фотопериод)\n"
         "/cmd <сообщение> — отправить команду на сервер\n"
         "/clear — очистить экран терминала",
         parse_mode="Markdown",
@@ -147,14 +156,16 @@ async def cmd_status(event):
     if not check_user(msg.chat.id): return
 
     pump = "💧 РАБОТАЕТ" if sensor_data["pump"] else "⛔ ОТКЛЮЧЕНА"
+    light = "💡 ВКЛЮЧЁН" if sensor_data.get("light") else "🌑 ВЫКЛЮЧЕН"
     soil_emoji = "⚠️ СУХО" if sensor_data["soil"] < 30 else "🌿 ОК"
-    
+
     text = (
         f"📊 *Телеметрия теплицы* ({sensor_data['updated']})\n\n"
         f"🪴 Влажность почвы: *{sensor_data['soil']}%* ({soil_emoji})\n"
         f"🌡 Температура воздуха: *{sensor_data['temp']}°C*\n"
         f"💨 Влажность воздуха: *{sensor_data['hum']}%*\n"
         f"⚙️ Состояние помпы: *{pump}*\n"
+        f"💡 Досветка (фотопериод): *{light}*\n"
     )
     await msg.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
 
@@ -225,6 +236,45 @@ async def cmd_pump_off(event):
     if mqtt_client_global:
         mqtt_client_global.publish(CONTROL_TOPIC, "PUMP_OFF")
         await msg.answer("⛔ Сигнал на *ВЫКЛЮЧЕНИЕ* помпы отправлен.", parse_mode="Markdown", reply_markup=main_keyboard())
+    else:
+        await msg.answer("❌ Ошибка: нет подключения к шине MQTT", reply_markup=main_keyboard())
+
+@dp.message(Command("light_on"))
+@dp.callback_query(F.data == "light_on")
+async def cmd_light_on(event):
+    msg = event.message if isinstance(event, types.CallbackQuery) else event
+    if isinstance(event, types.CallbackQuery): await event.answer()
+    if not check_user(msg.chat.id): return
+
+    if mqtt_client_global:
+        mqtt_client_global.publish(CONTROL_TOPIC, "LIGHT_ON")
+        await msg.answer("💡 Свет включён вручную (авторасписание приостановлено).", parse_mode="Markdown", reply_markup=main_keyboard())
+    else:
+        await msg.answer("❌ Ошибка: нет подключения к шине MQTT", reply_markup=main_keyboard())
+
+@dp.message(Command("light_off"))
+@dp.callback_query(F.data == "light_off")
+async def cmd_light_off(event):
+    msg = event.message if isinstance(event, types.CallbackQuery) else event
+    if isinstance(event, types.CallbackQuery): await event.answer()
+    if not check_user(msg.chat.id): return
+
+    if mqtt_client_global:
+        mqtt_client_global.publish(CONTROL_TOPIC, "LIGHT_OFF")
+        await msg.answer("🌑 Свет выключен вручную (авторасписание приостановлено).", parse_mode="Markdown", reply_markup=main_keyboard())
+    else:
+        await msg.answer("❌ Ошибка: нет подключения к шине MQTT", reply_markup=main_keyboard())
+
+@dp.message(Command("light_auto"))
+@dp.callback_query(F.data == "light_auto")
+async def cmd_light_auto(event):
+    msg = event.message if isinstance(event, types.CallbackQuery) else event
+    if isinstance(event, types.CallbackQuery): await event.answer()
+    if not check_user(msg.chat.id): return
+
+    if mqtt_client_global:
+        mqtt_client_global.publish(CONTROL_TOPIC, "LIGHT_AUTO")
+        await msg.answer("⏱ Свет возвращён на автоматическое расписание (фотопериод).", parse_mode="Markdown", reply_markup=main_keyboard())
     else:
         await msg.answer("❌ Ошибка: нет подключения к шине MQTT", reply_markup=main_keyboard())
 
